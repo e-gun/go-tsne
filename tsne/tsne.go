@@ -299,52 +299,74 @@ func (tsne *TSNE) costGradient(P, Y mat.Matrix) float64 {
 			}
 		}
 	} else {
-		tsne.dCdY = tsne.pcg(origdCdY, Y, mult)
+		// faster than monothreaded, but there is a lot of overhead: we are looping this *many* times
+		// https://stackoverflow.com/questions/52403157/matrix-multiplication-with-goroutine-drops-performance
+		tsne.dCdY = tsne.mpgradient(origdCdY, Y, mult)
 	}
 
 	return divergence
 }
 
-func (tsne *TSNE) pcg(orig mat.Dense, Y mat.Matrix, mult *mat.Dense) *mat.Dense {
-	// https://stackoverflow.com/questions/52403157/matrix-multiplication-with-goroutine-drops-performance
-	// https://stackoverflow.com/questions/50179290/vectorise-a-function-taking-advantage-of-concurrency/50179617#50179617
-	// https://stackoverflow.com/questions/38170852/is-this-an-idiomatic-worker-thread-pool-in-go/38172204#38172204
+func chunker[T any](items []T, size int) (chunks [][]T) {
+	for size < len(items) {
+		items, chunks = items[size:], append(chunks, items[0:size:size])
+	}
+	return append(chunks, items)
+}
 
-	n, d := Y.Dims()
+func (tsne *TSNE) mpgradient(origdCdY mat.Dense, Y mat.Matrix, mult *mat.Dense) *mat.Dense {
+	rows, d := Y.Dims()
 
 	type NumbereddCdY struct {
-		num  int
-		dCdY *mat.Dense
+		num int
+		row []float64
 	}
 
-	dorow := func(r int, thisdCdY *mat.Dense) NumbereddCdY {
-		for c := 0; c < n; c++ {
+	doonerow := func(r int, thisrow []float64) NumbereddCdY {
+		for c := 0; c < rows; c++ {
 			m := mult.At(r, c)
 			for k := 0; k < d; k++ {
 				yDiff := Y.At(r, k) - Y.At(c, k)
-				orig := thisdCdY.At(r, k)
-				// fmt.Printf("r: %d; c: %d; k:%d; orig: %f\n", r, c, k, orig)
-				thisdCdY.Set(r, k, orig+m*yDiff)
+				thisrow[k] = thisrow[k] + m*yDiff
 			}
 		}
 		ncd := NumbereddCdY{
-			num:  r,
-			dCdY: thisdCdY,
+			num: r,
+			row: thisrow,
 		}
 		return ncd
 	}
 
+	dorows := func(rows []NumbereddCdY) []NumbereddCdY {
+		processed := make([]NumbereddCdY, len(rows))
+		for i := 0; i < len(rows); i++ {
+			processed[i] = doonerow(rows[i].num, rows[i].row)
+		}
+		return processed
+	}
+
+	decomposed := make([]NumbereddCdY, rows)
+	for i := 0; i < rows; i++ {
+		decomposed[i] = NumbereddCdY{
+			num: i,
+			row: origdCdY.RawRowView(i),
+		}
+	}
+
+	chunksize := (rows + tsne.workercount) / tsne.workercount
+	workchunks := chunker(decomposed, chunksize)
+
 	var wg sync.WaitGroup
 	var collector []NumbereddCdY
-	outputchannels := make(chan NumbereddCdY, tsne.workercount)
+	outputchannels := make(chan []NumbereddCdY, tsne.workercount)
 
-	for i := 0; i < n; i++ {
+	for i := 0; i < tsne.workercount; i++ {
 		wg.Add(1)
-		dCdY := orig
-		go func(i int, dCdY *mat.Dense) {
-			outputchannels <- dorow(i, dCdY)
+		wc := workchunks[i]
+		go func(wc []NumbereddCdY) {
+			outputchannels <- dorows(wc)
 			wg.Done()
-		}(i, &dCdY)
+		}(wc)
 	}
 
 	go func() {
@@ -353,17 +375,16 @@ func (tsne *TSNE) pcg(orig mat.Dense, Y mat.Matrix, mult *mat.Dense) *mat.Dense 
 	}()
 
 	for c := range outputchannels {
-		collector = append(collector, c)
+		collector = append(collector, c...)
 	}
 
 	RedomposedCdY := mat.NewDense(tsne.n, tsne.dimsOut, nil)
 
 	for _, ncd := range collector {
-		rn := ncd.num
-		rv := mat.Row(nil, rn, ncd.dCdY)
-		RedomposedCdY.SetRow(rn, rv)
+		RedomposedCdY.SetRow(ncd.num, ncd.row)
 	}
 	return RedomposedCdY
+
 }
 
 //
