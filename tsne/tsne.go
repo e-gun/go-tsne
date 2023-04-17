@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"sync"
 
 	"gonum.org/v1/gonum/mat"
 )
@@ -29,13 +30,14 @@ type TSNE struct {
 	learningRate float64 // Gradient descent learning rate
 	verbose      bool    // If true, then TSNE outputs progress data to stdout
 	maxIter      int     // Max number of gradient descent iterations
+	workercount  int     // number of goroutines for costGradient()
 
 	P *mat.Dense // Matrix of pairwise affinities in the high dimensional space (Gaussian kernel)
 	Q *mat.Dense // Matrix of pairwise affinities in the low dimensional space (t-Student kernel)
 	Y *mat.Dense // The output embedding with dimsOut dimensions
 
-	PlogP        float64    // The constant portion of the KL divergence, computed only once
-	ExporteddCdY *mat.Dense // Gradient of the KL divergence with respect to the low dimensional map
+	PlogP float64    // The constant portion of the KL divergence, computed only once
+	dCdY  *mat.Dense // Gradient of the KL divergence with respect to the low dimensional map
 }
 
 // NewTSNE creates and returns a new t-SNE dimensionality reductor with the specified parameters.
@@ -47,6 +49,19 @@ func NewTSNE(dimensionsOut int, perplexity, learningRate float64, maxIter int, v
 	tsne.learningRate = learningRate
 	tsne.maxIter = maxIter
 	tsne.verbose = verbose
+	return tsne
+}
+
+// NewMPTSNE - same as NewTSNE but you can multithread
+func NewMPTSNE(wc int, dimensionsOut int, perplexity, learningRate float64, maxIter int, verbose bool) *TSNE {
+
+	tsne := new(TSNE)
+	tsne.dimsOut = dimensionsOut
+	tsne.perplexity = perplexity
+	tsne.learningRate = learningRate
+	tsne.maxIter = maxIter
+	tsne.verbose = verbose
+	tsne.workercount = wc
 	return tsne
 }
 
@@ -87,7 +102,7 @@ func (tsne *TSNE) initSolution() {
 	}, tsne.Y)
 
 	// Allocate gradient matrix
-	tsne.ExporteddCdY = mat.NewDense(tsne.n, tsne.dimsOut, nil)
+	tsne.dCdY = mat.NewDense(tsne.n, tsne.dimsOut, nil)
 
 	// Compute and store the constant portion of the KL divergence
 	PlogP := mat.NewDense(tsne.n, tsne.n, nil)
@@ -195,7 +210,7 @@ func (tsne *TSNE) run(stepFunc func(iter int, divergence float64, embedding mat.
 		divergence := tsne.costGradient(tsne.P, tsne.Y)
 		// Step in the direction of negative gradient (times the learning rate)
 		scaledGrad := mat.NewDense(tsne.n, tsne.dimsOut, nil)
-		scaledGrad.CloneFrom(tsne.ExporteddCdY)
+		scaledGrad.CloneFrom(tsne.dCdY)
 		scaledGrad.Scale(tsne.learningRate, scaledGrad)
 		tsne.Y.Sub(tsne.Y, scaledGrad)
 		// Reproject Y to have zero mean
@@ -227,6 +242,13 @@ func (tsne *TSNE) costGradient(P, Y mat.Matrix) float64 {
 	// Initialize divergence and gradient matrix
 	var divergence float64
 	n, d := Y.Dims()
+
+	origdCdY := *tsne.dCdY
+
+	// fmt.Printf("n: %d, d: %d\n", n, d)
+	// n: original number of rows
+	// d: number of target dimensions
+
 	// Compute Q matrix of low dimensional affinities (unnormalized at first)
 	Qu := mat.DenseCopyOf(SquaredDistanceMatrix(Y))
 	Qu.Apply(func(i, j int, v float64) float64 {
@@ -261,17 +283,87 @@ func (tsne *TSNE) costGradient(P, Y mat.Matrix) float64 {
 	mult.Scale(4, mult)
 	mult.MulElem(mult, Qu)
 	// Compute the gradient
-	for r := 0; r < n; r++ {
+
+	// note that this is square: r -> n; c -> n
+
+	if tsne.workercount == 0 {
+		for r := 0; r < n; r++ {
+			for c := 0; c < n; c++ {
+				m := mult.At(r, c)
+				for k := 0; k < d; k++ {
+					yDiff := Y.At(r, k) - Y.At(c, k)
+					orig := tsne.dCdY.At(r, k)
+					// fmt.Printf("r: %d; c: %d; k:%d; orig: %f\n", r, c, k, orig)
+					tsne.dCdY.Set(r, k, orig+m*yDiff)
+				}
+			}
+		}
+	} else {
+		tsne.dCdY = tsne.pcg(origdCdY, Y, mult)
+	}
+
+	return divergence
+}
+
+func (tsne *TSNE) pcg(orig mat.Dense, Y mat.Matrix, mult *mat.Dense) *mat.Dense {
+	// https://stackoverflow.com/questions/52403157/matrix-multiplication-with-goroutine-drops-performance
+	// https://stackoverflow.com/questions/50179290/vectorise-a-function-taking-advantage-of-concurrency/50179617#50179617
+	// https://stackoverflow.com/questions/38170852/is-this-an-idiomatic-worker-thread-pool-in-go/38172204#38172204
+
+	n, d := Y.Dims()
+
+	type NumbereddCdY struct {
+		num  int
+		dCdY *mat.Dense
+	}
+
+	dorow := func(r int, thisdCdY *mat.Dense) NumbereddCdY {
 		for c := 0; c < n; c++ {
 			m := mult.At(r, c)
 			for k := 0; k < d; k++ {
 				yDiff := Y.At(r, k) - Y.At(c, k)
-				orig := tsne.ExporteddCdY.At(r, k)
-				tsne.ExporteddCdY.Set(r, k, orig+m*yDiff)
+				orig := thisdCdY.At(r, k)
+				// fmt.Printf("r: %d; c: %d; k:%d; orig: %f\n", r, c, k, orig)
+				thisdCdY.Set(r, k, orig+m*yDiff)
 			}
 		}
+		ncd := NumbereddCdY{
+			num:  r,
+			dCdY: thisdCdY,
+		}
+		return ncd
 	}
-	return divergence
+
+	var wg sync.WaitGroup
+	var collector []NumbereddCdY
+	outputchannels := make(chan NumbereddCdY, tsne.workercount)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		dCdY := orig
+		go func(i int, dCdY *mat.Dense) {
+			outputchannels <- dorow(i, dCdY)
+			wg.Done()
+		}(i, &dCdY)
+	}
+
+	go func() {
+		wg.Wait()
+		close(outputchannels)
+	}()
+
+	for c := range outputchannels {
+		collector = append(collector, c)
+	}
+
+	RedomposedCdY := mat.NewDense(tsne.n, tsne.dimsOut, nil)
+
+	for _, ncd := range collector {
+		rn := ncd.num
+		rv := mat.Row(nil, rn, ncd.dCdY)
+		RedomposedCdY.SetRow(rn, rv)
+	}
+	return RedomposedCdY
 }
 
 //
