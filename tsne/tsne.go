@@ -34,8 +34,8 @@ type TSNE struct {
 	Q *mat.Dense // Matrix of pairwise affinities in the low dimensional space (t-Student kernel)
 	Y *mat.Dense // The output embedding with dimsOut dimensions
 
-	PlogP float64    // The constant portion of the KL divergence, computed only once
-	dCdY  *mat.Dense // Gradient of the KL divergence with respect to the low dimensional map
+	PlogP        float64    // The constant portion of the KL divergence, computed only once
+	ExporteddCdY *mat.Dense // Gradient of the KL divergence with respect to the low dimensional map
 }
 
 // NewTSNE creates and returns a new t-SNE dimensionality reductor with the specified parameters.
@@ -87,7 +87,7 @@ func (tsne *TSNE) initSolution() {
 	}, tsne.Y)
 
 	// Allocate gradient matrix
-	tsne.dCdY = mat.NewDense(tsne.n, tsne.dimsOut, nil)
+	tsne.ExporteddCdY = mat.NewDense(tsne.n, tsne.dimsOut, nil)
 
 	// Compute and store the constant portion of the KL divergence
 	PlogP := mat.NewDense(tsne.n, tsne.n, nil)
@@ -195,7 +195,7 @@ func (tsne *TSNE) run(stepFunc func(iter int, divergence float64, embedding mat.
 		divergence := tsne.costGradient(tsne.P, tsne.Y)
 		// Step in the direction of negative gradient (times the learning rate)
 		scaledGrad := mat.NewDense(tsne.n, tsne.dimsOut, nil)
-		scaledGrad.CloneFrom(tsne.dCdY)
+		scaledGrad.CloneFrom(tsne.ExporteddCdY)
 		scaledGrad.Scale(tsne.learningRate, scaledGrad)
 		tsne.Y.Sub(tsne.Y, scaledGrad)
 		// Reproject Y to have zero mean
@@ -223,7 +223,7 @@ func (tsne *TSNE) run(stepFunc func(iter int, divergence float64, embedding mat.
 // It also computes the gradient of the divergence with respect to the
 // low-dimensional map Y (the desired output of t-SNE).
 func (tsne *TSNE) costGradient(P, Y mat.Matrix) float64 {
-
+	// NOTE: this is the slow part of the whole thing
 	// Initialize divergence and gradient matrix
 	var divergence float64
 	n, d := Y.Dims()
@@ -266,8 +266,8 @@ func (tsne *TSNE) costGradient(P, Y mat.Matrix) float64 {
 			m := mult.At(r, c)
 			for k := 0; k < d; k++ {
 				yDiff := Y.At(r, k) - Y.At(c, k)
-				orig := tsne.dCdY.At(r, k)
-				tsne.dCdY.Set(r, k, orig+m*yDiff)
+				orig := tsne.ExporteddCdY.At(r, k)
+				tsne.ExporteddCdY.Set(r, k, orig+m*yDiff)
 			}
 		}
 	}
@@ -304,7 +304,6 @@ func Diagonal(a mat.Matrix) mat.Vector {
 // Returns a matrix where the {i, j}-th element is the squared euclidean distance between the i-th and j-th rows in X.
 //
 // D(x, y)^2 = ∥y – x∥^2 = x'x + y'y – 2 x'y
-//
 func SquaredDistanceMatrix(X mat.Matrix) mat.Matrix {
 
 	n, _ := X.Dims()

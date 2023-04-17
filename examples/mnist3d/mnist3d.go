@@ -4,7 +4,7 @@
 package main
 
 import (
-	"github.com/danaugrs/go-tsne/tsne"
+	"github.com/e-gun/go-tsne/go-tsne/tsne"
 	"github.com/sjwhitworth/golearn/pca"
 	"gonum.org/v1/gonum/mat"
 
