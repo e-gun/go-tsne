@@ -6,7 +6,7 @@ go 1.17
 // replace github.com/danaugrs/go-tsne/tsne => ../../tsne
 
 require (
-	github.com/e-gun/go-tsne/go-tsne/tsne v0.0.0
+	github.com/e-gun/go-tsne/go-tsne/tsne v.0.0.1
 	github.com/sjwhitworth/golearn v0.0.0-20211014193759-a8b69c276cd8
 	gonum.org/v1/gonum v0.9.3
 	gonum.org/v1/plot v0.9.0

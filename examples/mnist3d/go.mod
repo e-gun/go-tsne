@@ -1,4 +1,4 @@
-module github.com/danaugrs/go-tsne/examples/mnist3d
+module github.com/e-gun/go-tsne/examples/mnist3d
 
 go 1.17
 
